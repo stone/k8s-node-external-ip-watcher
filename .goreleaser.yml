@@ -52,17 +52,17 @@ nfpms:
     bindir: /usr/bin
 
     contents:
-      - src: ./tools/packaging/config.yaml
+      - src: tools/packaging/config.yaml
         dst: /etc/k8s-node-external-ip-watcher/config.yaml
         type: config|noreplace
         file_info:
           mode: 0644
-      - src: ./tools/packaging/template.tmpl
+      - src: tools/packaging/template.tmpl
         dst: /etc/k8s-node-external-ip-watcher/template.tmpl
         type: config|noreplace
         file_info:
           mode: 0644
-      - src: ./tools/packaging/k8s-node-external-ip-watcher.service
+      - src: tools/packaging/k8s-node-external-ip-watcher.service
         dst: /usr/lib/systemd/system/k8s-node-external-ip-watcher.service
         type: config|noreplace
         file_info:
@@ -76,7 +76,7 @@ nfpms:
         file_info:
           mode: 0644
     scripts:
-      postinstall: ./tools/packaging/postinstall.sh
+      postinstall: tools/packaging/postinstall.sh
     deb:
       lintian_overrides:
         - statically-linked-binary
