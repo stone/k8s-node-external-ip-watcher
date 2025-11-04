@@ -1,0 +1,29 @@
+# k8s-node-external-ip-watcher configuration
+
+# Log level: debug, info, warn, error
+logLevel: info
+
+# Path to kubeconfig file (optional, will try default locations)
+# kubeConfig: /path/to/kubeconfig
+
+# Path to the Go template file
+templatePath: /etc/k8s-node-external-ip-watcher/template.tmpl
+
+# Path where the rendered output will be written
+outputPath: /etc/k8s-node-external-ip-watcher/node-ips.txt
+
+# Command to execute after rendering the template
+# The output file path will be passed as the only argument
+command: /bin/true
+
+# Static IPs to always include in the output
+staticIPs:
+  - "192.168.1.100"
+  - "192.168.1.101"
+
+# How often to resync with the Kubernetes API (in seconds)
+resyncInterval: 300
+
+# Minimum number of nodes required (safety check to prevent empty list)
+# Set to 0 to disable this check
+minNodeCount: 1
