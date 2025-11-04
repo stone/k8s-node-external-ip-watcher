@@ -1,0 +1,33 @@
+# Binaries
+k8s-node-external-ip-watcher*
+*.exe
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Examples
+*.example
+
+# Config files
+config.yaml
+*.tmpl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Output
+*.conf
+*.output
+/tmp/
+/dist/
