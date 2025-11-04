@@ -1,0 +1,14 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-ip-watcher
+  labels:
+    app: node-ip-watcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: node-ip-watcher
+subjects:
+  - kind: ServiceAccount
+    name: node-ip-watcher
+    namespace: default

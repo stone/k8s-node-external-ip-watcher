@@ -216,3 +216,65 @@ backend k8s_nodes
     server {{ .Name }} {{ .ExternalIP }}:80 check
 {{- end }}
 ```
+
+## Kubernetes RBAC Setup for k8s-node-external-ip-watcher
+
+There are example RBAC manifests in the `k8s-manifests` directory.
+These manifests create a ServiceAccount with minimal permissions required to
+monitor Kubernetes node changes (add/update/delete events) and read node
+external IPs.
+
+Apply the RBAC resources:
+
+```bash
+kubectl apply -f k8s-manifests/
+```
+
+The `node-ip-watcher` ServiceAccount has only these permissions:
+
+- `get` - Read individual node details
+- `list` - List all nodes in the cluster
+- `watch` - Subscribe to node change events
+
+These are the minimal permissions required for the application to function.
+
+
+Create `kubeconfig` file using the `node-ip-watcher` ServiceAccount token and CA cert.
+```bash
+CLUSTER_NAME=$(kubectl config view -o jsonpath='{.clusters[0].name}')
+CLUSTER_SERVER=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
+CLUSTER_CA=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+CLUSTER_TOKEN=$(kubectl create token node-ip-watcher -n default --duration=87600h)
+
+cat > kubeconfig <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: ${CLUSTER_CA}
+    server: ${CLUSTER_SERVER}
+  name: ${CLUSTER_NAME}
+contexts:
+- context:
+    cluster: ${CLUSTER_NAME}
+    user: node-ip-watcher
+  name: node-ip-watcher
+current-context: node-ip-watcher
+users:
+- name: node-ip-watcher
+  user:
+    token: ${CLUSTER_TOKEN}
+EOF
+```
+
+Tests:
+```bash
+KUBECONFIG=kubeconfig kubectl auth can-i list nodes
+KUBECONFIG=kubeconfig kubectl auth can-i watch nodes
+# Should fail
+KUBECONFIG=kubeconfig kubectl auth can-i list pods
+```
+
+Update config.yaml to include the path to the generated kubeconfig.
+
+
