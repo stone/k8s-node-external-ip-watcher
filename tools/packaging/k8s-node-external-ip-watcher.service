@@ -1,0 +1,23 @@
+[Unit]
+Description=Kubernetes Node External IP Watcher
+Documentation=https://github.com/stone/k8s-node-external-ip-watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=k8s-node-external-ip-watcher
+WorkingDirectory=/var/lib/k8s-node-external-ip-watcher
+ExecStart=/usr/bin/k8s-node-external-ip-watcher -config /etc/k8s-node-external-ip-watcher/config.yaml
+# Give a reasonable amount of time for the server to start up/shut down
+TimeoutSec = 120
+Restart = on-failure
+RestartSec = 2
+NoNewPrivileges=true
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=k8s-node-external-ip-watcher
+
+[Install]
+WantedBy=multi-user.target
