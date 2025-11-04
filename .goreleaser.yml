@@ -9,7 +9,7 @@ before:
 builds:
   - id: k8s-node-external-ip-watcher
     binary: k8s-node-external-ip-watcher
-    main: ./main.go
+    main: main.go
     env:
       - CGO_ENABLED=0
     goos:
