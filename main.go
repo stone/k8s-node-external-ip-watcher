@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"sync"
 	"syscall"
 	"text/template"
@@ -433,16 +434,30 @@ func (w *Watcher) renderAndExecute() error {
 	return w.executeCommand()
 }
 
-// calculateHash generates a hash of the node data for deduplication
 func (w *Watcher) calculateHash(data NodeData) string {
 	h := sha256.New()
-	for _, node := range data.Nodes {
+
+	// Sort nodes for consistent hashing
+	nodes := make([]NodeInfo, len(data.Nodes))
+	copy(nodes, data.Nodes)
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Name < nodes[j].Name
+	})
+
+	for _, node := range nodes {
 		h.Write([]byte(node.Name))
 		h.Write([]byte(node.ExternalIP))
 	}
-	for _, ip := range data.StaticIPs {
+
+	// Sort IPs for consistent hashing
+	ips := make([]string, len(data.StaticIPs))
+	copy(ips, data.StaticIPs)
+	sort.Strings(ips)
+
+	for _, ip := range ips {
 		h.Write([]byte(ip))
 	}
+
 	return hex.EncodeToString(h.Sum(nil))
 }
 
