@@ -26,6 +26,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// version is set via ldflags during build
+var version = "dev"
+
 // Config is the application configuration
 type Config struct {
 	LogLevel       string   `yaml:"logLevel"`
@@ -69,7 +72,13 @@ func main() {
 	kubeConfig := flag.String("kubeconfig", "", "Path to kubeconfig file")
 	templatePath := flag.String("template", "", "Path to template file")
 	outputPath := flag.String("output", "", "Path to output file")
+	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	cfg, err := loadConfig(*configFile, *logLevel, *kubeConfig, *templatePath, *outputPath)
 	if err != nil {
@@ -78,7 +87,7 @@ func main() {
 	}
 
 	logger := setupLogger(cfg.LogLevel)
-	logger.Info("Starting k8s-node-external-ip-watcher", "config", *configFile)
+	logger.Info("Starting k8s-node-external-ip-watcher", "version", version, "config", *configFile)
 
 	// Create watcher
 	watcher, err := NewWatcher(cfg, logger)
