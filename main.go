@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,6 +19,8 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
@@ -29,6 +32,56 @@ import (
 // version is set via ldflags during build
 var version = "dev"
 
+// Prometheus metrics
+var (
+	nodeEventsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "k8s_node_watcher_events_total",
+			Help: "Total number of node events processed by type",
+		},
+		[]string{"event_type"},
+	)
+
+	rendersTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "k8s_node_watcher_renders_total",
+			Help: "Total number of template renders by result",
+		},
+		[]string{"result"},
+	)
+
+	commandExecutionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "k8s_node_watcher_command_executions_total",
+			Help: "Total number of command executions by result",
+		},
+		[]string{"result"},
+	)
+
+	currentNodeCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8s_node_watcher_nodes_current",
+			Help: "Current number of nodes being monitored",
+		},
+	)
+
+	watcherStartTime = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8s_node_watcher_start_time_seconds",
+			Help: "Unix timestamp of when the watcher started",
+		},
+	)
+)
+
+func init() {
+	// Register prom metrics
+	prometheus.MustRegister(nodeEventsTotal)
+	prometheus.MustRegister(rendersTotal)
+	prometheus.MustRegister(commandExecutionsTotal)
+	prometheus.MustRegister(currentNodeCount)
+	prometheus.MustRegister(watcherStartTime)
+}
+
 // Config is the application configuration
 type Config struct {
 	LogLevel       string   `yaml:"logLevel"`
@@ -39,6 +92,7 @@ type Config struct {
 	StaticIPs      []string `yaml:"staticIPs"`
 	ResyncInterval int      `yaml:"resyncInterval"` // in seconds
 	MinNodeCount   int      `yaml:"minNodeCount"`   // minimum nodes to prevent empty list
+	MetricsAddr    string   `yaml:"metricsAddr"`    // address for metrics/health HTTP server
 }
 
 // NodeData is the template data
@@ -72,6 +126,7 @@ func main() {
 	kubeConfig := flag.String("kubeconfig", "", "Path to kubeconfig file")
 	templatePath := flag.String("template", "", "Path to template file")
 	outputPath := flag.String("output", "", "Path to output file")
+	metricsAddr := flag.String("metrics-addr", "", "Address for metrics and health (default: localhost:8089)")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	flag.Parse()
 
@@ -80,7 +135,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg, err := loadConfig(*configFile, *logLevel, *kubeConfig, *templatePath, *outputPath)
+	cfg, err := loadConfig(*configFile, *logLevel, *kubeConfig, *templatePath, *outputPath, *metricsAddr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load configuration: %v\n", err)
 		os.Exit(1)
@@ -88,6 +143,22 @@ func main() {
 
 	logger := setupLogger(cfg.LogLevel)
 	logger.Info("Starting k8s-node-external-ip-watcher", "version", version, "config", *configFile)
+
+	// Set start time metric
+	watcherStartTime.Set(float64(time.Now().Unix()))
+
+	// Start HTTP local http server for metrics and helth checks
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	httpServer := startHTTPServer(cfg.MetricsAddr, logger)
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("HTTP server shutdown error", "error", err)
+		}
+	}()
 
 	// Create watcher
 	watcher, err := NewWatcher(cfg, logger)
@@ -97,9 +168,6 @@ func main() {
 	}
 
 	// Run watcher
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
 	if err := watcher.Run(ctx); err != nil {
 		logger.Error("Watcher failed", "error", err)
 		os.Exit(1)
@@ -109,11 +177,12 @@ func main() {
 }
 
 // loadConfig load configuration from file and applies flag overrides
-func loadConfig(configFile, logLevel, kubeConfig, templatePath, outputPath string) (*Config, error) {
+func loadConfig(configFile, logLevel, kubeConfig, templatePath, outputPath, metricsAddr string) (*Config, error) {
 	cfg := &Config{
 		LogLevel:       "info",
-		ResyncInterval: 300, // 5 minutes default
-		MinNodeCount:   1,   // at least 1 node by default (saftey net?)
+		ResyncInterval: 300,              // 5 minutes default
+		MinNodeCount:   1,                // at least 1 node by default (saftey net?)
+		MetricsAddr:    "localhost:8089", // default metric listener address
 	}
 
 	// Load from file if it exists
@@ -140,6 +209,9 @@ func loadConfig(configFile, logLevel, kubeConfig, templatePath, outputPath strin
 	}
 	if outputPath != "" {
 		cfg.OutputPath = outputPath
+	}
+	if metricsAddr != "" {
+		cfg.MetricsAddr = metricsAddr
 	}
 
 	// Validate required fields
@@ -179,6 +251,34 @@ func setupLogger(level string) *slog.Logger {
 
 	handler := slog.NewTextHandler(os.Stdout, opts)
 	return slog.New(handler)
+}
+
+// startHTTPServer starts the HTTP server for metrics and health endpoints
+func startHTTPServer(addr string, logger *slog.Logger) *http.Server {
+	mux := http.NewServeMux()
+
+	// Simple 200 OK health check endpoint
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok\n"))
+	})
+
+	// Metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
+
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	go func() {
+		logger.Info("Starting HTTP server", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("HTTP server error", "error", err)
+		}
+	}()
+
+	return server
 }
 
 // NewWatcher creates a new API Watcher instance
@@ -304,6 +404,9 @@ func (w *Watcher) initialSync(informer cache.SharedIndexInformer) error {
 		}
 	}
 
+	// Update node count gauge
+	currentNodeCount.Set(float64(len(w.nodeIPs)))
+
 	// Check minimum node count (warning only, don't fail on startup)
 	if len(w.nodeIPs) < w.config.MinNodeCount {
 		w.logger.Warn("Node count below minimum, skipping initial render",
@@ -328,6 +431,9 @@ func (w *Watcher) initialSync(informer cache.SharedIndexInformer) error {
 func (w *Watcher) handleNodeEvent(eventType string, node *corev1.Node) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	// Increment event counter
+	nodeEventsTotal.WithLabelValues(eventType).Inc()
 
 	nodeName := node.Name
 	oldIP := w.nodeIPs[nodeName]
@@ -367,6 +473,9 @@ func (w *Watcher) handleNodeEvent(eventType string, node *corev1.Node) {
 			}
 		}
 	}
+
+	// Update node count gauge
+	currentNodeCount.Set(float64(len(w.nodeIPs)))
 
 	// If nothing changed, skip rendering
 	if !changed {
@@ -425,19 +534,23 @@ func (w *Watcher) renderAndExecute() error {
 
 	outputFile, err := os.Create(w.config.OutputPath)
 	if err != nil {
+		rendersTotal.WithLabelValues("failure").Inc()
 		return fmt.Errorf("create output file: %w", err)
 	}
 	defer outputFile.Close()
 
 	if err := w.tmpl.Execute(outputFile, data); err != nil {
+		rendersTotal.WithLabelValues("failure").Inc()
 		return fmt.Errorf("execute template: %w", err)
 	}
 
 	if err := outputFile.Sync(); err != nil {
+		rendersTotal.WithLabelValues("failure").Inc()
 		return fmt.Errorf("sync output file: %w", err)
 	}
 
 	w.currentHash = dataHash
+	rendersTotal.WithLabelValues("success").Inc()
 
 	// Execute command
 	return w.executeCommand()
@@ -482,9 +595,11 @@ func (w *Watcher) executeCommand() error {
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
+		commandExecutionsTotal.WithLabelValues("failure").Inc()
 		return fmt.Errorf("execute command: %w", err)
 	}
 
+	commandExecutionsTotal.WithLabelValues("success").Inc()
 	w.logger.Info("Command executed successfully")
 	return nil
 }
