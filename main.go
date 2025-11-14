@@ -147,7 +147,7 @@ func main() {
 	// Set start time metric
 	watcherStartTime.Set(float64(time.Now().Unix()))
 
-	// Start HTTP local http server for metrics and helth checks
+	// Start HTTP local http server for metrics and health checks
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
