@@ -181,7 +181,7 @@ func loadConfig(configFile, logLevel, kubeConfig, templatePath, outputPath, metr
 	cfg := &Config{
 		LogLevel:       "info",
 		ResyncInterval: 300,              // 5 minutes default
-		MinNodeCount:   1,                // at least 1 node by default (saftey net?)
+		MinNodeCount:   1,                // at least 1 node by default (safety net?)
 		MetricsAddr:    "localhost:8089", // default metric listener address
 	}
 
