@@ -1,6 +1,11 @@
 package main
 
 import (
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -156,6 +161,82 @@ func TestCalculateHash(t *testing.T) {
 
 		if hash1 == "" {
 			t.Error("hash should not be empty string")
+		}
+	})
+}
+
+func TestHTTPEndpoints(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	addr := "localhost:18080"
+
+	server := startHTTPServer(addr, logger)
+	defer server.Close()
+
+	// Allow some time for the server to start
+	time.Sleep(100 * time.Millisecond)
+
+	t.Run("healthz endpoint returns 200 OK", func(t *testing.T) {
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err != nil {
+			t.Fatalf("error calling /healthz: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("failed to read response body: %v", err)
+		}
+
+		if string(body) != "ok\n" {
+			t.Errorf("expected body 'ok\\n', got %q", string(body))
+		}
+	})
+
+	t.Run("metrics endpoint must return Prometheus format", func(t *testing.T) {
+		resp, err := http.Get("http://" + addr + "/metrics")
+		if err != nil {
+			t.Fatalf("error calling /metrics: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected status 200, got %d", resp.StatusCode)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("failed to read response body: %v", err)
+		}
+
+		bodyStr := string(body)
+
+		// Check for always metrics
+		expectedGauges := []string{
+			"k8s_node_watcher_nodes_current",
+			"k8s_node_watcher_start_time_seconds",
+		}
+
+		for _, metric := range expectedGauges {
+			if !strings.Contains(bodyStr, metric) {
+				t.Errorf("expected gauge metric %q not found in response", metric)
+			}
+		}
+
+		// Check for Prometheus format comments
+		if !strings.Contains(bodyStr, "# HELP") {
+			t.Error("expected Prometheus HELP comments")
+		}
+		if !strings.Contains(bodyStr, "# TYPE") {
+			t.Error("expected Prometheus TYPE comments")
+		}
+
+		// Check for standard Go metrics
+		if !strings.Contains(bodyStr, "go_goroutines") {
+			t.Error("expected standard go metrics (go_goroutines) in response")
 		}
 	})
 }
