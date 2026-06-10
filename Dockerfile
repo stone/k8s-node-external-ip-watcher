@@ -1,11 +1,11 @@
 FROM golang:1 AS builder
 WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
 RUN set -eux ; \
   apt-get update; \
   apt-get install -y --no-install-recommends ca-certificates; \
-  go mod download; \
-  go mod tidy; \
   mkdir -p output; \
   mkdir -p config; \
   CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags '-extldflags "-static"' -o k8s-node-external-ip-watcher .

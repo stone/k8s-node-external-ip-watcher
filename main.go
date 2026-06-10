@@ -2,12 +2,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -61,7 +64,7 @@ var (
 	currentNodeCount = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "k8s_node_watcher_nodes_current",
-			Help: "Current number of nodes being monitored",
+			Help: "Current number of nodes with an external IP",
 		},
 	)
 
@@ -93,6 +96,7 @@ type Config struct {
 	ResyncInterval int      `yaml:"resyncInterval"` // in seconds
 	MinNodeCount   int      `yaml:"minNodeCount"`   // minimum nodes to prevent empty list
 	MetricsAddr    string   `yaml:"metricsAddr"`    // address for metrics/health HTTP server
+	CommandTimeout int      `yaml:"commandTimeout"` // max command runtime in seconds
 }
 
 // NodeData is the template data
@@ -109,6 +113,11 @@ type NodeInfo struct {
 	ExternalIP string
 }
 
+// defaultDebounce is how long the render loop waits after the first
+// pending change so bursts of node events (e.g. the informer replaying
+// all nodes at startup) coalesce into a single render+command
+const defaultDebounce = 2 * time.Second
+
 // Watcher manages the node watching logic
 type Watcher struct {
 	config      *Config
@@ -118,6 +127,8 @@ type Watcher struct {
 	currentHash string
 	nodeIPs     map[string]string // node name -> external IP
 	tmpl        *template.Template
+	renderCh    chan struct{} // signals the render loop that state changed
+	debounce    time.Duration
 }
 
 func main() {
@@ -151,7 +162,11 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	httpServer := startHTTPServer(cfg.MetricsAddr, logger)
+	httpServer, err := startHTTPServer(cfg.MetricsAddr, logger)
+	if err != nil {
+		logger.Error("Failed to start HTTP server", "error", err)
+		os.Exit(1)
+	}
 	defer func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
@@ -183,6 +198,7 @@ func loadConfig(configFile, logLevel, kubeConfig, templatePath, outputPath, metr
 		ResyncInterval: 300,              // 5 minutes default
 		MinNodeCount:   1,                // at least 1 node by default (safety net?)
 		MetricsAddr:    "localhost:8089", // default metric listener address
+		CommandTimeout: 30,               // 30 seconds default
 	}
 
 	// Load from file if it exists
@@ -224,6 +240,15 @@ func loadConfig(configFile, logLevel, kubeConfig, templatePath, outputPath, metr
 	if cfg.Command == "" {
 		return nil, fmt.Errorf("command is required")
 	}
+	if cfg.ResyncInterval < 0 {
+		return nil, fmt.Errorf("resyncInterval must not be negative, got %d", cfg.ResyncInterval)
+	}
+	if cfg.MinNodeCount < 0 {
+		return nil, fmt.Errorf("minNodeCount must not be negative, got %d", cfg.MinNodeCount)
+	}
+	if cfg.CommandTimeout <= 0 {
+		return nil, fmt.Errorf("commandTimeout must be positive, got %d", cfg.CommandTimeout)
+	}
 
 	return cfg, nil
 }
@@ -253,50 +278,78 @@ func setupLogger(level string) *slog.Logger {
 	return slog.New(handler)
 }
 
-// startHTTPServer starts the HTTP server for metrics and health endpoints
-func startHTTPServer(addr string, logger *slog.Logger) *http.Server {
+// startHTTPServer starts the HTTP server for metrics and health endpoints.
+// The listener is opened synchronously so a bad address fails at startup;
+// the returned server's Addr holds the actual listen address
+func startHTTPServer(addr string, logger *slog.Logger) (*http.Server, error) {
 	mux := http.NewServeMux()
 
 	// Simple 200 OK health check endpoint
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok\n"))
+		_, _ = w.Write([]byte("ok\n"))
 	})
 
 	// Metrics endpoint
 	mux.Handle("/metrics", promhttp.Handler())
 
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
 	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              listener.Addr().String(),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	go func() {
-		logger.Info("Starting HTTP server", "addr", addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Info("Starting HTTP server", "addr", server.Addr)
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error("HTTP server error", "error", err)
 		}
 	}()
 
-	return server
+	return server, nil
 }
 
-// NewWatcher creates a new API Watcher instance
-func NewWatcher(cfg *Config, logger *slog.Logger) (*Watcher, error) {
-	kubeconfig := cfg.KubeConfig
-	if kubeconfig == "" {
-		kubeconfig = os.Getenv("KUBECONFIG")
-		if kubeconfig == "" {
-			homeDir, err := os.UserHomeDir()
-			if err == nil {
-				kubeconfig = filepath.Join(homeDir, ".kube", "config")
+// buildRestConfig resolves a kubeconfig path (explicit config, KUBECONFIG env
+// var, then ~/.kube/config) and falls back to in-cluster configuration when
+// no kubeconfig file is found
+func buildRestConfig(kubeConfig string) (*rest.Config, error) {
+	if kubeConfig == "" {
+		kubeConfig = os.Getenv("KUBECONFIG")
+	}
+	if kubeConfig == "" {
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			candidate := filepath.Join(homeDir, ".kube", "config")
+			if _, err := os.Stat(candidate); err == nil {
+				kubeConfig = candidate
 			}
 		}
 	}
 
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if kubeConfig == "" {
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("no kubeconfig found and in-cluster config failed: %w", err)
+		}
+		return config, nil
+	}
+
+	config, err := clientcmd.BuildConfigFromFlags("", kubeConfig)
 	if err != nil {
-		return nil, fmt.Errorf("build kubeconfig: %w", err)
+		return nil, fmt.Errorf("build kubeconfig from %s: %w", kubeConfig, err)
+	}
+	return config, nil
+}
+
+// NewWatcher creates a new API Watcher instance
+func NewWatcher(cfg *Config, logger *slog.Logger) (*Watcher, error) {
+	config, err := buildRestConfig(cfg.KubeConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -310,12 +363,27 @@ func NewWatcher(cfg *Config, logger *slog.Logger) (*Watcher, error) {
 	}
 
 	return &Watcher{
-		config:  cfg,
-		client:  clientset,
-		logger:  logger,
-		nodeIPs: make(map[string]string),
-		tmpl:    tmpl,
+		config:   cfg,
+		client:   clientset,
+		logger:   logger,
+		nodeIPs:  make(map[string]string),
+		tmpl:     tmpl,
+		renderCh: make(chan struct{}, 1),
+		debounce: defaultDebounce,
 	}, nil
+}
+
+// nodeFromObj extracts a Node from an informer event object, unwrapping
+// DeletedFinalStateUnknown tombstones delivered when a delete was missed.
+func nodeFromObj(obj any) (*corev1.Node, bool) {
+	if node, ok := obj.(*corev1.Node); ok {
+		return node, true
+	}
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		node, ok := tombstone.Obj.(*corev1.Node)
+		return node, ok
+	}
+	return nil, false
 }
 
 // Run starts the watcher
@@ -333,23 +401,36 @@ func (w *Watcher) Run(ctx context.Context) error {
 	//  - Handle node cordoning/draining?
 	_, err := nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
-			node := obj.(*corev1.Node)
-			w.handleNodeEvent("ADD", node)
+			if node, ok := nodeFromObj(obj); ok {
+				w.handleNodeEvent("ADD", node)
+			} else {
+				w.logger.Warn("Received non-node object in ADD event")
+			}
 		},
 		UpdateFunc: func(oldObj, newObj any) {
-			node := newObj.(*corev1.Node)
-			w.handleNodeEvent("UPDATE", node)
+			if node, ok := nodeFromObj(newObj); ok {
+				w.handleNodeEvent("UPDATE", node)
+			} else {
+				w.logger.Warn("Received non-node object in UPDATE event")
+			}
 		},
 		DeleteFunc: func(obj any) {
-			node := obj.(*corev1.Node)
-			w.handleNodeEvent("DELETE", node)
+			if node, ok := nodeFromObj(obj); ok {
+				w.handleNodeEvent("DELETE", node)
+			} else {
+				w.logger.Warn("Received non-node object in DELETE event")
+			}
 		},
 	})
 	if err != nil {
 		return fmt.Errorf("add event handler: %w", err)
 	}
 
-	// Start informer
+	// Start the debounced render loop; node events only signal it
+	go w.renderLoop(ctx)
+
+	// Start informer. It replays every existing node as an ADD event,
+	// so no separate initial sync is needed
 	factory.Start(ctx.Done())
 
 	// Wait for cache sync
@@ -358,73 +439,47 @@ func (w *Watcher) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to sync cache")
 	}
 
-	w.logger.Info("Cache synced, performing initial sync")
-
-	// Perform initial sync to get all current nodes
-	// This will not fail even if there are no nodes yet
-	if err := w.initialSync(nodeInformer); err != nil {
-		w.logger.Error("Initial sync failed, continuing to watch", "error", err)
-	} else {
-		w.logger.Info("Initial sync complete, watching for node changes")
-	}
+	w.logger.Info("Cache synced, watching for node changes")
 
 	<-ctx.Done()
 	return nil
 }
 
-// initialSync fetches all current nodes and renders the initial template
-func (w *Watcher) initialSync(informer cache.SharedIndexInformer) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+// renderLoop renders and executes after node changes, debouncing bursts of
+// events into a single render
+func (w *Watcher) renderLoop(ctx context.Context) {
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	pending := false
 
-	// List all nodes from informer's store
-	items := informer.GetStore().List()
-	w.logger.Info("Initial node discovery", "count", len(items))
-
-	// Extract external IPs from all nodes
-	for _, item := range items {
-		node, ok := item.(*corev1.Node)
-		if !ok {
-			w.logger.Warn("Unexpected object type in store")
-			continue
-		}
-		var externalIP string
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == corev1.NodeExternalIP {
-				externalIP = addr.Address
-				break
+	for {
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-w.renderCh:
+			if !pending {
+				timer.Reset(w.debounce)
+				pending = true
+			}
+		case <-timer.C:
+			pending = false
+			if err := w.renderAndExecute(); err != nil {
+				w.logger.Error("Failed to render and execute", "error", err)
 			}
 		}
-
-		if externalIP != "" {
-			w.nodeIPs[node.Name] = externalIP
-			w.logger.Info("Discovered node", "node", node.Name, "ip", externalIP)
-		} else {
-			w.logger.Debug("Node has no external IP", "node", node.Name)
-		}
 	}
+}
 
-	// Update node count gauge
-	currentNodeCount.Set(float64(len(w.nodeIPs)))
-
-	// Check minimum node count (warning only, don't fail on startup)
-	if len(w.nodeIPs) < w.config.MinNodeCount {
-		w.logger.Warn("Node count below minimum, skipping initial render",
-			"current", len(w.nodeIPs),
-			"minimum", w.config.MinNodeCount,
-		)
-		return nil
+// signalRender wakes the render loop without blocking; if a render is
+// already pending the signal is coalesced
+func (w *Watcher) signalRender() {
+	select {
+	case w.renderCh <- struct{}{}:
+	default:
 	}
-
-	// Render and execute for initial state
-	if len(w.nodeIPs) > 0 {
-		if err := w.renderAndExecute(); err != nil {
-			w.logger.Error("Initial render failed, will retry on node changes", "error", err)
-			// Don't return error - continue watching
-		}
-	}
-
-	return nil
 }
 
 // handleNodeEvent processes node events
@@ -472,6 +527,12 @@ func (w *Watcher) handleNodeEvent(eventType string, node *corev1.Node) {
 				w.logger.Info("Node IP changed", "node", nodeName, "oldIP", oldIP, "newIP", newIP)
 			}
 		}
+	} else if oldIP != "" {
+		// Safety net: a node that loses its external IP keeps its last
+		// known IP until the node object is deleted, so a transient
+		// cloud-provider hiccup never drops it from the rendered list
+		w.logger.Warn("Node lost its external IP, retaining last known IP until node is deleted",
+			"node", nodeName, "ip", oldIP)
 	}
 
 	// Update node count gauge
@@ -483,33 +544,42 @@ func (w *Watcher) handleNodeEvent(eventType string, node *corev1.Node) {
 		return
 	}
 
-	// Safety check: prevent removing all nodes
-	if len(w.nodeIPs) < w.config.MinNodeCount {
-		w.logger.Error("Safety check failed: node count below minimum",
-			"current", len(w.nodeIPs),
-			"minimum", w.config.MinNodeCount,
-		)
-		return
-	}
-
-	// Render and execute
-	if err := w.renderAndExecute(); err != nil {
-		w.logger.Error("Failed to render and execute", "error", err)
-	}
+	// Wake the debounced render loop
+	w.signalRender()
 }
 
-// renderAndExecute renders the template and executes the command
+// renderAndExecute renders the template and executes the command.
+// It snapshots state under the read lock so event handling is never
+// blocked by file writes or command execution
 func (w *Watcher) renderAndExecute() error {
-	// Build node data
+	// Build node data from a snapshot of current state
+	w.mu.RLock()
 	nodes := make([]NodeInfo, 0, len(w.nodeIPs))
-	allIPs := make([]string, 0, len(w.nodeIPs)+len(w.config.StaticIPs))
-
 	for name, ip := range w.nodeIPs {
 		nodes = append(nodes, NodeInfo{
 			Name:       name,
 			ExternalIP: ip,
 		})
-		allIPs = append(allIPs, ip)
+	}
+	w.mu.RUnlock()
+
+	// Sort by node name so the rendered output is deterministic
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Name < nodes[j].Name
+	})
+
+	allIPs := make([]string, 0, len(nodes)+len(w.config.StaticIPs))
+	for _, node := range nodes {
+		allIPs = append(allIPs, node.ExternalIP)
+	}
+
+	// Safety check: never render an empty/short node list
+	if len(nodes) < w.config.MinNodeCount {
+		w.logger.Warn("Safety check failed: node count below minimum, skipping render",
+			"current", len(nodes),
+			"minimum", w.config.MinNodeCount,
+		)
+		return nil
 	}
 
 	// Add our static IPs
@@ -529,24 +599,21 @@ func (w *Watcher) renderAndExecute() error {
 		return nil
 	}
 
-	// Render template to file
+	// Render template to a buffer first so a failed render never
+	// touches the existing output file
 	w.logger.Info("Rendering template", "output", w.config.OutputPath, "nodeCount", len(nodes))
 
-	outputFile, err := os.Create(w.config.OutputPath)
-	if err != nil {
-		rendersTotal.WithLabelValues("failure").Inc()
-		return fmt.Errorf("create output file: %w", err)
-	}
-	defer outputFile.Close()
-
-	if err := w.tmpl.Execute(outputFile, data); err != nil {
+	var buf bytes.Buffer
+	if err := w.tmpl.Execute(&buf, data); err != nil {
 		rendersTotal.WithLabelValues("failure").Inc()
 		return fmt.Errorf("execute template: %w", err)
 	}
 
-	if err := outputFile.Sync(); err != nil {
+	// Write to a temp file in the same directory and rename it over the
+	// output path so consumers never see a partial file
+	if err := w.writeOutputAtomic(buf.Bytes()); err != nil {
 		rendersTotal.WithLabelValues("failure").Inc()
-		return fmt.Errorf("sync output file: %w", err)
+		return err
 	}
 
 	w.currentHash = dataHash
@@ -554,6 +621,39 @@ func (w *Watcher) renderAndExecute() error {
 
 	// Execute command
 	return w.executeCommand()
+}
+
+// writeOutputAtomic writes content to a temp file in the output directory,
+// fsyncs it and renames it over the output path
+func (w *Watcher) writeOutputAtomic(content []byte) error {
+	dir := filepath.Dir(w.config.OutputPath)
+	tmpFile, err := os.CreateTemp(dir, ".node-ips-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp output file: %w", err)
+	}
+	tmpName := tmpFile.Name()
+	defer os.Remove(tmpName) // no-op after successful rename
+
+	if _, err := tmpFile.Write(content); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("write temp output file: %w", err)
+	}
+	if err := tmpFile.Chmod(0644); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("chmod temp output file: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("sync temp output file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp output file: %w", err)
+	}
+
+	if err := os.Rename(tmpName, w.config.OutputPath); err != nil {
+		return fmt.Errorf("rename temp output file: %w", err)
+	}
+	return nil
 }
 
 func (w *Watcher) calculateHash(data NodeData) string {
@@ -566,10 +666,19 @@ func (w *Watcher) calculateHash(data NodeData) string {
 		return nodes[i].Name < nodes[j].Name
 	})
 
+	// Separate fields with a NUL byte so distinct states never
+	// concatenate to the same byte stream
+	sep := []byte{0}
+
 	for _, node := range nodes {
 		h.Write([]byte(node.Name))
+		h.Write(sep)
 		h.Write([]byte(node.ExternalIP))
+		h.Write(sep)
 	}
+
+	// Section marker between nodes and static IPs
+	h.Write([]byte{1})
 
 	// Sort IPs for consistent hashing
 	ips := make([]string, len(data.StaticIPs))
@@ -578,6 +687,7 @@ func (w *Watcher) calculateHash(data NodeData) string {
 
 	for _, ip := range ips {
 		h.Write([]byte(ip))
+		h.Write(sep)
 	}
 
 	return hex.EncodeToString(h.Sum(nil))
@@ -590,7 +700,10 @@ func (w *Watcher) executeCommand() error {
 		"arg", w.config.OutputPath,
 	)
 
-	cmd := exec.Command(w.config.Command, w.config.OutputPath)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(w.config.CommandTimeout)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, w.config.Command, w.config.OutputPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
