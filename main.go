@@ -113,9 +113,8 @@ type NodeInfo struct {
 	ExternalIP string
 }
 
-// defaultDebounce is how long the render loop waits after the first
-// pending change so bursts of node events (e.g. the informer replaying
-// all nodes at startup) coalesce into a single render+command
+// defaultDebounce is how long the render loop waits after the first change,
+// so event bursts coalesce into one render+command (see adr/0001)
 const defaultDebounce = 2 * time.Second
 
 // defaultRetryDelay is how long the render loop waits before retrying a
@@ -283,9 +282,8 @@ func setupLogger(level string) *slog.Logger {
 	return slog.New(handler)
 }
 
-// startHTTPServer starts the HTTP server for metrics and health endpoints.
-// The listener is opened synchronously so a bad address fails at startup;
-// the returned server's Addr holds the actual listen address
+// startHTTPServer starts the metrics/health server. It listens synchronously
+// so a bad address fails at startup; Addr holds the actual listen address
 func startHTTPServer(addr string, logger *slog.Logger) (*http.Server, error) {
 	mux := http.NewServeMux()
 
@@ -319,9 +317,8 @@ func startHTTPServer(addr string, logger *slog.Logger) (*http.Server, error) {
 	return server, nil
 }
 
-// buildRestConfig resolves a kubeconfig path (explicit config, KUBECONFIG env
-// var, then ~/.kube/config) and falls back to in-cluster configuration when
-// no kubeconfig file is found
+// buildRestConfig resolves kubeconfig (config, KUBECONFIG, ~/.kube/config)
+// and falls back to in-cluster config when no file is found
 func buildRestConfig(kubeConfig string) (*rest.Config, error) {
 	if kubeConfig == "" {
 		kubeConfig = os.Getenv("KUBECONFIG")
@@ -401,10 +398,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 	nodeInformer := factory.Core().V1().Nodes().Informer()
 
 	// Add event handlers for node events
-	// TODO:
-	// 	- Watch for NodeNotReady conditions?
-	//  - Handle taints?
-	//  - Handle node cordoning/draining?
+	// TODO: handle NotReady conditions, taints and cordoning/draining?
 	_, err := nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
 			if node, ok := nodeFromObj(obj); ok {
@@ -537,9 +531,8 @@ func (w *Watcher) handleNodeEvent(eventType string, node *corev1.Node) {
 			}
 		}
 	} else if oldIP != "" {
-		// Safety net: a node that loses its external IP keeps its last
-		// known IP until the node object is deleted, so a transient
-		// cloud-provider hiccup never drops it from the rendered list
+		// Safety net: keep the last known IP until the node is deleted,
+		// so a transient cloud-provider hiccup never drops it (see adr/0002)
 		w.logger.Warn("Node lost its external IP, retaining last known IP until node is deleted",
 			"node", nodeName, "ip", oldIP)
 	}
@@ -557,9 +550,8 @@ func (w *Watcher) handleNodeEvent(eventType string, node *corev1.Node) {
 	w.signalRender()
 }
 
-// renderAndExecute renders the template and executes the command.
-// It snapshots state under the read lock so event handling is never
-// blocked by file writes or command execution
+// renderAndExecute renders the template and executes the command, using a
+// snapshot of state so event handling never waits on file writes or commands
 func (w *Watcher) renderAndExecute() error {
 	// Build node data from a snapshot of current state
 	w.mu.RLock()
@@ -582,7 +574,7 @@ func (w *Watcher) renderAndExecute() error {
 		allIPs = append(allIPs, node.ExternalIP)
 	}
 
-	// Safety check: never render an empty/short node list
+	// Safety check: never render an empty/short node list (see adr/0002)
 	if len(nodes) < w.config.MinNodeCount {
 		w.logger.Warn("Safety check failed: node count below minimum, skipping render",
 			"current", len(nodes),
@@ -618,11 +610,8 @@ func (w *Watcher) renderAndExecute() error {
 		return fmt.Errorf("execute template: %w", err)
 	}
 
-	// Write in place: needs write access to the file only, not its
-	// directory, and keeps the file's owner, mode and symlinks intact.
-	// shortcut: not atomic; a crash mid-write can leave a partial file,
-	// which the next render overwrites. Consumers read it only after the
-	// command runs, so they never see a partial write in normal operation
+	// shortcut: in-place write, not atomic; a crash mid-write leaves a
+	// partial file until the next render (see adr/0003)
 	if err := os.WriteFile(w.config.OutputPath, buf.Bytes(), 0644); err != nil {
 		rendersTotal.WithLabelValues("failure").Inc()
 		return fmt.Errorf("write output file: %w", err)
@@ -631,7 +620,7 @@ func (w *Watcher) renderAndExecute() error {
 	rendersTotal.WithLabelValues("success").Inc()
 
 	// Only remember this state once the command succeeded, so a failed
-	// command is retried instead of skipped as "unchanged"
+	// command is retried, not skipped as "unchanged" (see adr/0004)
 	if err := w.executeCommand(); err != nil {
 		return err
 	}
