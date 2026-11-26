@@ -29,13 +29,8 @@ cleanInstall() {
     fi
     printf "Reload the service unit from disk\n"
     systemctl daemon-reload ||:
-    #printf "Unmask the service\n"
-    #systemctl unmask k8s-node-external-ip-watcher ||:
-    #printf "Set the preset flag for the service unit\n"
-    #systemctl preset k8s-node-external-ip-watcher ||:
-    #printf "Set the enabled flag for the service unit\n"
-    #systemctl enable k8s-node-external-ip-watcher ||:
-    #systemctl restart k8s-node-external-ip-watcher ||:
+    # The service is not enabled or started on purpose; configure it first, then
+    # run: systemctl enable --now k8s-node-external-ip-watcher
 }
 
 upgrade() {

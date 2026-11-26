@@ -11,6 +11,9 @@ k8s-node-external-ip-watcher
 # Output of the go coverage tool
 *.out
 
+# Local cluster credentials - never commit
+k3d/kubeconfig
+
 # Config files (keep examples)
 config.yaml
 *.tmpl
