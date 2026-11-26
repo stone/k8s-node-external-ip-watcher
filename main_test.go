@@ -265,12 +265,13 @@ func newTestWatcher(t *testing.T, tmplText string, cfg *Config) *Watcher {
 		cfg.CommandTimeout = 30
 	}
 	return &Watcher{
-		config:   cfg,
-		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		nodeIPs:  map[string]string{"node1": "1.2.3.4"},
-		tmpl:     tmpl,
-		renderCh: make(chan struct{}, 1),
-		debounce: defaultDebounce,
+		config:     cfg,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nodeIPs:    map[string]string{"node1": "1.2.3.4"},
+		tmpl:       tmpl,
+		renderCh:   make(chan struct{}, 1),
+		debounce:   defaultDebounce,
+		retryDelay: defaultRetryDelay,
 	}
 }
 
@@ -766,4 +767,69 @@ func TestHTTPEndpoints(t *testing.T) {
 			t.Error("expected standard go metrics (go_goroutines) in response")
 		}
 	})
+}
+
+func TestWriteOutputReadOnlyDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	// Common setup: the service user may write the output file but not
+	// create files in its directory (e.g. /etc/varnish/backends.vcl)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.conf")
+	if err := os.WriteFile(out, []byte("old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0755) })
+
+	w := newTestWatcher(t, "{{range .AllIPs}}{{.}}\n{{end}}", &Config{OutputPath: out})
+	if err := w.renderAndExecute(); err != nil {
+		t.Fatalf("render into read-only dir failed: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "1.2.3.4\n" {
+		t.Errorf("output = %q, want %q", got, "1.2.3.4\n")
+	}
+}
+
+func TestFailedCommandIsRetried(t *testing.T) {
+	dir := t.TempDir()
+	countFile := filepath.Join(dir, "count")
+	marker := filepath.Join(dir, "marker")
+	script := filepath.Join(dir, "flaky.sh")
+	// Fails on the first run, succeeds afterwards
+	body := "#!/bin/sh\necho run >> " + countFile + "\n" +
+		"[ -f " + marker + " ] || { touch " + marker + "; exit 1; }\n"
+	if err := os.WriteFile(script, []byte(body), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	w := newTestWatcher(t, "{{range .AllIPs}}{{.}}\n{{end}}", &Config{
+		OutputPath: filepath.Join(dir, "out.conf"),
+		Command:    script,
+	})
+	w.debounce = 10 * time.Millisecond
+	w.retryDelay = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.renderLoop(ctx)
+
+	// One signal, no further node events: the loop must retry on its own
+	w.signalRender()
+	time.Sleep(400 * time.Millisecond)
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("command never ran: %v", err)
+	}
+	if got := strings.Count(string(data), "run"); got != 2 {
+		t.Errorf("expected 2 command runs (fail, then retry succeeds), got %d", got)
+	}
 }

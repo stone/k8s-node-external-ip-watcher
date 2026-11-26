@@ -118,6 +118,10 @@ type NodeInfo struct {
 // all nodes at startup) coalesce into a single render+command
 const defaultDebounce = 2 * time.Second
 
+// defaultRetryDelay is how long the render loop waits before retrying a
+// failed render or command when no node event arrives in the meantime
+const defaultRetryDelay = 30 * time.Second
+
 // Watcher manages the node watching logic
 type Watcher struct {
 	config      *Config
@@ -129,6 +133,7 @@ type Watcher struct {
 	tmpl        *template.Template
 	renderCh    chan struct{} // signals the render loop that state changed
 	debounce    time.Duration
+	retryDelay  time.Duration // wait before retrying a failed render or command
 }
 
 func main() {
@@ -363,13 +368,14 @@ func NewWatcher(cfg *Config, logger *slog.Logger) (*Watcher, error) {
 	}
 
 	return &Watcher{
-		config:   cfg,
-		client:   clientset,
-		logger:   logger,
-		nodeIPs:  make(map[string]string),
-		tmpl:     tmpl,
-		renderCh: make(chan struct{}, 1),
-		debounce: defaultDebounce,
+		config:     cfg,
+		client:     clientset,
+		logger:     logger,
+		nodeIPs:    make(map[string]string),
+		tmpl:       tmpl,
+		renderCh:   make(chan struct{}, 1),
+		debounce:   defaultDebounce,
+		retryDelay: defaultRetryDelay,
 	}, nil
 }
 
@@ -467,7 +473,10 @@ func (w *Watcher) renderLoop(ctx context.Context) {
 		case <-timer.C:
 			pending = false
 			if err := w.renderAndExecute(); err != nil {
-				w.logger.Error("Failed to render and execute", "error", err)
+				w.logger.Error("Failed to render and execute, will retry",
+					"error", err, "retryIn", w.retryDelay)
+				timer.Reset(w.retryDelay)
+				pending = true
 			}
 		}
 	}
@@ -609,50 +618,24 @@ func (w *Watcher) renderAndExecute() error {
 		return fmt.Errorf("execute template: %w", err)
 	}
 
-	// Write to a temp file in the same directory and rename it over the
-	// output path so consumers never see a partial file
-	if err := w.writeOutputAtomic(buf.Bytes()); err != nil {
+	// Write in place: needs write access to the file only, not its
+	// directory, and keeps the file's owner, mode and symlinks intact.
+	// shortcut: not atomic; a crash mid-write can leave a partial file,
+	// which the next render overwrites. Consumers read it only after the
+	// command runs, so they never see a partial write in normal operation
+	if err := os.WriteFile(w.config.OutputPath, buf.Bytes(), 0644); err != nil {
 		rendersTotal.WithLabelValues("failure").Inc()
-		return err
+		return fmt.Errorf("write output file: %w", err)
 	}
 
-	w.currentHash = dataHash
 	rendersTotal.WithLabelValues("success").Inc()
 
-	// Execute command
-	return w.executeCommand()
-}
-
-// writeOutputAtomic writes content to a temp file in the output directory,
-// fsyncs it and renames it over the output path
-func (w *Watcher) writeOutputAtomic(content []byte) error {
-	dir := filepath.Dir(w.config.OutputPath)
-	tmpFile, err := os.CreateTemp(dir, ".node-ips-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp output file: %w", err)
+	// Only remember this state once the command succeeded, so a failed
+	// command is retried instead of skipped as "unchanged"
+	if err := w.executeCommand(); err != nil {
+		return err
 	}
-	tmpName := tmpFile.Name()
-	defer os.Remove(tmpName) // no-op after successful rename
-
-	if _, err := tmpFile.Write(content); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("write temp output file: %w", err)
-	}
-	if err := tmpFile.Chmod(0644); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("chmod temp output file: %w", err)
-	}
-	if err := tmpFile.Sync(); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("sync temp output file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("close temp output file: %w", err)
-	}
-
-	if err := os.Rename(tmpName, w.config.OutputPath); err != nil {
-		return fmt.Errorf("rename temp output file: %w", err)
-	}
+	w.currentHash = dataHash
 	return nil
 }
 
